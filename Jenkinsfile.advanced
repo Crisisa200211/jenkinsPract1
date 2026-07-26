@@ -1,0 +1,379 @@
+pipeline {
+    agent none
+    
+    environment {
+        APP_NAME = 'jenkins-microservices-app'
+        DOCKER_REGISTRY = 'registry.example.com'
+        GIT_COMMIT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+        BUILD_TIMESTAMP = sh(script: 'date +%Y%m%d%H%M%S', returnStdout: true).trim()
+        FEATURE_BRANCH = env.BRANCH_NAME ==~ /feature\/.*/
+        PERFORMANCE_THRESHOLD = '500' // ms
+    }
+    
+    stages {
+        stage('Preparación y Validación') {
+            parallel {
+                stage('Verificar Código') {
+                    agent { label 'docker' }
+                    steps {
+                        echo '🔍 Validando estructura del proyecto...'
+                        sh '''
+                            for service in api-gateway user-service product-service; do
+                                if [ ! -d "services/$service" ]; then
+                                    echo "❌ Servicio $service no encontrado"
+                                    exit 1
+                                fi
+                                if [ ! -f "services/$service/package.json" ]; then
+                                    echo "❌ package.json no encontrado en $service"
+                                    exit 1
+                                fi
+                            done
+                        '''
+                    }
+                }
+                
+                stage('Análisis Estático') {
+                    agent {
+                        docker {
+                            image 'node:18-alpine'
+                            args '-u root'
+                        }
+                    }
+                    steps {
+                        echo '🔎 Ejecutando análisis de código...'
+                        sh '''
+                            for service in api-gateway user-service product-service; do
+                                cd services/$service
+                                npm ci
+                                npm run lint || true
+                                cd ../..
+                            done
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Pruebas de Contrato') {
+            agent {
+                docker {
+                    image 'node:18-alpine'
+                    args '-u root'
+                }
+            }
+            steps {
+                echo '📋 Verificando contratos entre servicios...'
+                script {
+                    // Validar que el contrato de usuario sea consistente
+                    def contract = readJSON file: 'shared/contracts/user-contract.json'
+                    echo "Contrato de usuario: ${contract}"
+                    
+                    // Verificar que todos los servicios implementan el contrato
+                    sh '''
+                        # Verificar User Service
+                        echo "Verificando User Service..."
+                        node scripts/validate-contract.js user-service shared/contracts/user-contract.json
+                        
+                        # Verificar API Gateway
+                        echo "Verificando API Gateway..."
+                        node scripts/validate-contract.js api-gateway shared/contracts/user-contract.json
+                    '''
+                }
+            }
+        }
+        
+        stage('Build y Test por Servicio') {
+            parallel {
+                stage('API Gateway') {
+                    agent { label 'docker' }
+                    steps {
+                        buildAndTestService('api-gateway')
+                    }
+                }
+                stage('User Service') {
+                    agent { label 'docker' }
+                    steps {
+                        buildAndTestService('user-service')
+                    }
+                }
+                stage('Product Service') {
+                    agent { label 'docker' }
+                    steps {
+                        buildAndTestService('product-service')
+                    }
+                }
+            }
+        }
+        
+        stage('Pruebas de Integración con Servicios Reales') {
+            agent { label 'docker' }
+            environment {
+                DOCKER_COMPOSE_FILE = 'docker/docker-compose.test.yml'
+            }
+            steps {
+                echo '🐳 Levantando entorno completo de integración...'
+                script {
+                    // Levantar servicios con todos los dependencias
+                    sh """
+                        docker-compose -f ${DOCKER_COMPOSE_FILE} up -d --build
+                        sleep 15
+                    """
+                    
+                    // Esperar health checks
+                    sh '''
+                        echo "Esperando servicios..."
+                        timeout 60 sh -c '
+                            while ! curl -s -f http://localhost:3000/health; do
+                                echo "Esperando API Gateway..."
+                                sleep 2
+                            done
+                        '
+                        timeout 60 sh -c '
+                            while ! curl -s -f http://localhost:3001/health; do
+                                echo "Esperando User Service..."
+                                sleep 2
+                            done
+                        '
+                    '''
+                    
+                    // Ejecutar pruebas de integración
+                    sh '''
+                        docker-compose -f docker/docker-compose.test.yml exec -T api-gateway npm run test:integration
+                        docker-compose -f docker/docker-compose.test.yml exec -T user-service npm run test:integration
+                        docker-compose -f docker/docker-compose.test.yml exec -T product-service npm run test:integration
+                    '''
+                }
+            }
+            post {
+                always {
+                    script {
+                        // Recolectar reports de todos los servicios
+                        sh '''
+                            docker-compose -f docker/docker-compose.test.yml logs --tail=50 > integration-logs.txt
+                        '''
+                    }
+                    junit '**/coverage/junit.xml'
+                    publishHTML([
+                        reportDir: 'coverage/lcov-report/',
+                        reportFiles: 'index.html',
+                        reportName: 'Integration Test Coverage'
+                    ])
+                    sh 'docker-compose -f docker/docker-compose.test.yml down -v'
+                }
+            }
+        }
+        
+        stage('Pruebas de Carga y Rendimiento') {
+            when {
+                expression { env.BRANCH_NAME == 'main' || env.BRANCH_NAME == 'release/*' }
+            }
+            agent { label 'docker' }
+            steps {
+                echo '⚡ Ejecutando pruebas de carga...'
+                script {
+                    sh '''
+                        docker-compose -f docker/docker-compose.performance.yml up -d
+                        sleep 20
+                        
+                        # Ejecutar K6 tests
+                        docker run --rm \
+                            --network jenkins-microservices-app_default \
+                            -v $(pwd)/tests/performance:/scripts \
+                            grafana/k6 run /scripts/load-test.js
+                    '''
+                }
+            }
+            post {
+                always {
+                    sh 'docker-compose -f docker/docker-compose.performance.yml down -v'
+                }
+            }
+        }
+        
+        stage('Pruebas de Resiliencia') {
+            when {
+                expression { env.BRANCH_NAME == 'main' }
+            }
+            agent { label 'docker' }
+            steps {
+                echo '🛡️ Probando resiliencia del sistema...'
+                script {
+                    // Simular fallos de servicios
+                    sh '''
+                        docker-compose -f docker/docker-compose.test.yml up -d
+                        sleep 10
+                        
+                        echo "=== Probando fallo de Redis ==="
+                        docker-compose -f docker/docker-compose.test.yml stop redis
+                        sleep 5
+                        
+                        # Verificar que el sistema sigue funcionando
+                        curl -f http://localhost:3000/health || exit 1
+                        curl -f http://localhost:3001/health || exit 1
+                        
+                        echo "=== Probando fallo de PostgreSQL ==="
+                        docker-compose -f docker/docker-compose.test.yml stop postgres
+                        sleep 5
+                        
+                        # Verificar degradación graceful
+                        response=$(curl -s http://localhost:3001/health)
+                        echo $response | grep -q '"status":"degraded"' || exit 1
+                        
+                        echo "=== Recuperando servicios ==="
+                        docker-compose -f docker/docker-compose.test.yml start postgres redis
+                        sleep 10
+                        
+                        # Verificar recuperación
+                        curl -f http://localhost:3000/health || exit 1
+                    '''
+                }
+            }
+            post {
+                always {
+                    sh 'docker-compose -f docker/docker-compose.test.yml down -v'
+                }
+            }
+        }
+        
+        stage('Construcción de Imágenes y Push') {
+            when {
+                expression { env.BRANCH_NAME == 'main' || env.BRANCH_NAME ==~ /release\/.*/ }
+            }
+            agent { label 'docker' }
+            steps {
+                echo '🏗️ Construyendo y subiendo imágenes a registry...'
+                script {
+                    // Construir y pushear cada servicio
+                    def services = ['api-gateway', 'user-service', 'product-service']
+                    services.each { service ->
+                        sh """
+                            docker build -t ${DOCKER_REGISTRY}/${APP_NAME}/${service}:${GIT_COMMIT} \
+                                -t ${DOCKER_REGISTRY}/${APP_NAME}/${service}:latest \
+                                -f services/${service}/Dockerfile services/${service}
+                            docker push ${DOCKER_REGISTRY}/${APP_NAME}/${service}:${GIT_COMMIT}
+                            docker push ${DOCKER_REGISTRY}/${APP_NAME}/${service}:latest
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Despliegue en Ambiente Efímero') {
+            when {
+                expression { env.FEATURE_BRANCH || env.BRANCH_NAME == 'main' }
+            }
+            agent { label 'docker' }
+            steps {
+                echo '🌐 Desplegando en ambiente efímero...'
+                script {
+                    def deployEnv = env.FEATURE_BRANCH ? 'staging' : 'production'
+                    def namespace = env.FEATURE_BRANCH ? "feature-${GIT_COMMIT}" : 'production'
+                    
+                    sh """
+                        # Crear namespace si no existe
+                        kubectl create namespace ${namespace} --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        # Desplegar con Helm
+                        helm upgrade --install ${APP_NAME}-${namespace} \
+                            ./helm-chart \
+                            --namespace ${namespace} \
+                            --set image.tag=${GIT_COMMIT} \
+                            --set environment=${deployEnv} \
+                            --set ingress.host=${namespace}.example.com \
+                            --set resources.requests.memory="256Mi" \
+                            --set resources.limits.memory="512Mi"
+                        
+                        # Esperar deployment
+                        kubectl rollout status deployment/${APP_NAME}-api-gateway -n ${namespace}
+                        kubectl rollout status deployment/${APP_NAME}-user-service -n ${namespace}
+                        kubectl rollout status deployment/${APP_NAME}-product-service -n ${namespace}
+                    """
+                }
+            }
+        }
+        
+        stage('Pruebas End-to-End en Ambiente Desplegado') {
+            when {
+                expression { env.BRANCH_NAME == 'main' }
+            }
+            agent { label 'docker' }
+            steps {
+                echo '🌐 Ejecutando pruebas E2E en ambiente desplegado...'
+                script {
+                    def url = 'https://staging.example.com' // o la URL del ambiente
+                    sh """
+                        # Ejecutar pruebas E2E con Cypress
+                        npm run test:e2e -- --baseUrl=${url} --reporter junit --reporter-options output=cypress-results.xml
+                    """
+                }
+            }
+            post {
+                always {
+                    junit 'cypress-results.xml'
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo '✅ Pipeline completado exitosamente'
+            emailext (
+                subject: "✅ Pipeline exitoso: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                    El pipeline microservices se completó correctamente.
+                    URL: ${env.BUILD_URL}
+                    Commit: ${GIT_COMMIT}
+                    Imágenes publicadas: ${DOCKER_REGISTRY}/${APP_NAME}
+                """,
+                to: 'equipo-dev@ejemplo.com'
+            )
+        }
+        failure {
+            echo '❌ Pipeline falló. Iniciando rollback...'
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    // Rollback automático
+                    sh """
+                        echo "Iniciando rollback..."
+                        kubectl rollout undo deployment/${APP_NAME}-api-gateway -n production
+                        kubectl rollout undo deployment/${APP_NAME}-user-service -n production
+                        kubectl rollout undo deployment/${APP_NAME}-product-service -n production
+                    """
+                }
+            }
+            emailext (
+                subject: "❌ Pipeline fallido: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                    El pipeline microservices falló.
+                    Revisa los logs en: ${env.BUILD_URL}
+                    Rollback automático ejecutado.
+                """,
+                to: 'equipo-dev@ejemplo.com'
+            )
+        }
+        always {
+            echo '🧹 Limpiando workspace...'
+            cleanWs()
+        }
+    }
+}
+
+// Función auxiliar para build y test de servicios
+def buildAndTestService(String serviceName) {
+    script {
+        sh """
+            cd services/${serviceName}
+            npm ci
+            npm run test:unit -- --coverage
+            npm run build || true
+            cd ../..
+        """
+    }
+    junit "services/${serviceName}/coverage/junit.xml"
+    publishHTML([
+        reportDir: "services/${serviceName}/coverage/lcov-report/",
+        reportFiles: 'index.html',
+        reportName: "${serviceName} Coverage"
+    ])
+}

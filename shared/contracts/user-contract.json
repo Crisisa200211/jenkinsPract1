@@ -1,0 +1,20 @@
+{
+  "consumer": {
+    "name": "API Gateway"
+  },
+  "provider": {
+    "name": "User Service"
+  },
+  "endpoints": [
+    {
+      "method": "post",
+      "path": "/users",
+      "description": "Create a new user"
+    },
+    {
+      "method": "get",
+      "path": "/users",
+      "description": "Get user by ID"
+    }
+  ]
+}
