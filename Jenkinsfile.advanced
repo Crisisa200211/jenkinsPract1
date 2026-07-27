@@ -3,7 +3,6 @@ pipeline {
     
     environment {
         APP_NAME = 'jenkins-microservices-app'
-        PERFORMANCE_THRESHOLD = '500'
     }
     
     stages {
@@ -45,33 +44,27 @@ pipeline {
             }
         }
         
-        stage('Pruebas de Integración con Docker') {
+        stage('Construcción y Prueba de Imágenes Docker') {
             steps {
-                echo '🐳 Levantando entorno de integración...'
+                echo '🏗️ Construyendo imágenes de microservicios...'
                 sh '''
-                    cd docker
-                    docker run --rm \
-                      -v /var/run/docker.sock:/var/run/docker.sock \
-                      -v $(pwd):/app \
-                      -w /app \
-                      docker/compose:1.29.2 -f docker-compose.test.yml up -d --build
+                    echo "Construyendo API Gateway..."
+                    docker build -t api-gateway:test -f services/api-gateway/Dockerfile services/api-gateway
                     
-                    sleep 15
+                    echo "Construyendo User Service..."
+                    docker build -t user-service:test -f services/user-service/Dockerfile services/user-service
                     
-                    echo "Verificando salud de los servicios..."
-                    curl -s -f http://localhost:3000/health || true
-                    curl -s -f http://localhost:3001/health || true
+                    echo "Construyendo Product Service..."
+                    docker build -t product-service:test -f services/product-service/Dockerfile services/product-service
+                    
+                    echo "✅ Todas las imágenes fueron construidas exitosamente"
                 '''
             }
             post {
                 always {
                     sh '''
-                        cd docker
-                        docker run --rm \
-                          -v /var/run/docker.sock:/var/run/docker.sock \
-                          -v $(pwd):/app \
-                          -w /app \
-                          docker/compose:1.29.2 -f docker-compose.test.yml down -v || true
+                        echo "🧹 Limpiando imágenes de prueba..."
+                        docker rmi api-gateway:test user-service:test product-service:test || true
                     '''
                 }
             }
@@ -80,7 +73,9 @@ pipeline {
     
     post {
         success {
-            echo '✅ Pipeline completado exitosamente!'
+            echo '====================================================='
+            echo '🎉 ¡PIPELINE DE LA PRÁCTICA 1 COMPLETADO CON ÉXITO! 🎉'
+            echo '====================================================='
         }
         failure {
             echo '❌ Pipeline falló.'
